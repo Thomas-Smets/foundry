@@ -538,6 +538,57 @@ fn canonicalize_monad_system_receipt(receipt: &mut Value, target_hash: &str) {
     receipt.remove("blobGasUsed");
 }
 
+/// Spawns an RPC proxy that answers `method` with a canned `result`, forwarding every other method
+/// to `endpoint`.
+///
+/// The returned counter records how many times `method` was requested, which lets tests assert
+/// that a code path short-circuited before reaching the upstream node.
+pub async fn spawn_rpc_proxy_canned_method(
+    endpoint: String,
+    method: &'static str,
+    result: Value,
+) -> (String, Arc<AtomicUsize>) {
+    let client = reqwest::Client::new();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let counter = calls.clone();
+    let router = Router::new().route(
+        "/",
+        post(move |Json(request): Json<Value>| {
+            let client = client.clone();
+            let endpoint = endpoint.clone();
+            let calls = calls.clone();
+            let result = result.clone();
+            async move {
+                if request.get("method").and_then(Value::as_str) == Some(method) {
+                    calls.fetch_add(1, Ordering::Relaxed);
+                    let id = request.get("id").cloned().unwrap_or(Value::Null);
+                    return Json(json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": result,
+                    }))
+                    .into_response();
+                }
+
+                let response = client
+                    .post(endpoint)
+                    .json(&request)
+                    .send()
+                    .await
+                    .unwrap()
+                    .json::<Value>()
+                    .await
+                    .unwrap();
+                Json(response).into_response()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    (format!("http://{address}"), counter)
+}
+
 #[cfg(test)]
 #[expect(clippy::disallowed_macros)]
 mod tests {
