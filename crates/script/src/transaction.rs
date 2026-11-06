@@ -170,9 +170,20 @@ impl<N: Network> ScriptTransactionBuilder<N> {
         result: &ScriptResult<N>,
         gas_estimate_multiplier: u64,
         linked_build_data: &LinkedBuildData,
+        profile_contracts: Option<&ContractsByArtifact>,
     ) -> Self {
         let mut created_contracts =
             result.get_created_contracts(&linked_build_data.known_contracts);
+
+        if let Some(contracts) = profile_contracts {
+            for created in &mut created_contracts {
+                if let Some(data) = contracts.values().find(|data| {
+                    data.bytecode().is_some_and(|code| created.init_code.starts_with(code))
+                }) {
+                    created.contract_name = Some(data.name.clone());
+                }
+            }
+        }
 
         // Add the additional contracts created in this transaction, so we can verify them later.
         created_contracts.retain(|contract| {

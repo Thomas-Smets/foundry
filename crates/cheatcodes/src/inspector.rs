@@ -49,10 +49,11 @@ use foundry_evm_core::{
     backend::{LocalForkId, RevertDiagnostic},
     constants::{CHEATCODE_ADDRESS, HARDHAT_CONSOLE_ADDRESS, MAGIC_ASSUME},
     evm::{
-        BlockEnvFor, EthEvmNetwork, EvmEnvFor, FoundryEvmFor, FoundryEvmNetwork, InterpreterFor,
-        MessageFor, MessageResultFor, PersistentWrite, SnapshotRestores, SpecFor,
+        BlockEnvFor, EthEvmNetwork, EvmEnvFor, EvmFactoryFor, FoundryEvmFor, FoundryEvmNetwork,
+        InterpreterFor, MessageFor, MessageResultFor, PersistentWrite, SnapshotRestores, SpecFor,
         TransactionRequestFor, TxFor, TxResultFor, restore_access_warmth,
     },
+    opts::{ExecutionSpecContext, resolve_execution_spec},
 };
 use foundry_evm_traces::{
     TracingInspector, TracingInspectorConfig, identifier::SignaturesIdentifier,
@@ -61,7 +62,7 @@ use itertools::Itertools;
 use rand::Rng;
 use std::{
     cmp::max,
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fmt::Debug,
     ops::Range,
     sync::{Arc, OnceLock},
@@ -516,6 +517,9 @@ impl ArbitraryStorage {
     }
 }
 
+/// Broadcaster, salt and CREATE2 libraries to deploy before the first broadcast to a fork.
+pub type ChainLibraries = (Address, B256, Vec<(Address, Bytes)>);
+
 /// List of transactions that can be broadcasted.
 pub type BroadcastableTransactions<N> = VecDeque<BroadcastableTransaction<N>>;
 
@@ -809,6 +813,12 @@ pub struct Cheatcodes<FEN: FoundryEvmNetwork = EthEvmNetwork> {
     /// The `vm.accessList` the running transaction last applied to a call or create. It replaces
     /// the transaction's access list when computing its stipend.
     pub applied_access_list: Option<AccessList>,
+
+    /// Spec of the run, restored for persistent accounts on forks of profiled endpoints.
+    run_spec: Option<SpecFor<FEN>>,
+
+    /// RPC urls of the forks whose CREATE2 libraries were deployed.
+    chain_libraries_deployed: BTreeSet<String>,
 }
 
 // This is not derived because calling this in `fn new` with `..Default::default()` creates a second
@@ -892,6 +902,8 @@ impl<FEN: FoundryEvmNetwork> Cheatcodes<FEN> {
             deploy_code_create_state_gas: 0,
             deploy_code_output: None,
             applied_access_list: None,
+            run_spec: None,
+            chain_libraries_deployed: Default::default(),
         }
     }
 
@@ -1266,6 +1278,50 @@ impl<FEN: FoundryEvmNetwork> Cheatcodes<FEN> {
             && interp.host().spec_id() >= evm2::SpecId::BERLIN
         {
             self.applied_access_list = Some(access_list.clone());
+        }
+    }
+
+    /// Whether this create belongs to the local script/test or is itself recorded for broadcast.
+    /// Never replace initcode inside an ordinary on-chain factory call.
+    pub fn should_use_profile_init_code(&self, depth: usize, caller: Address) -> bool {
+        let depth = self.deploy_code_caller_depth(depth);
+        if let Some(broadcast) = &self.broadcast {
+            depth == broadcast.depth && caller == broadcast.original_caller
+        } else {
+            depth == 1 && caller != self.core.config.evm_opts.create2_deployer
+        }
+    }
+
+    /// Returns the spec `message` runs with on forks of profiled endpoints: the spec of the
+    /// profile for frames of non-persistent accounts, except top-level creates, or the spec of
+    /// the run.
+    pub fn profile_spec(
+        &mut self,
+        running: &EvmEnvFor<FEN>,
+        chain_id: u64,
+        message: &MessageFor<FEN>,
+        backend: &dyn CheatcodesBackend<FEN>,
+    ) -> SpecFor<FEN> {
+        let run_spec = *self.run_spec.get_or_insert(running.spec);
+        let db = backend.backend();
+        let profiled = if message.kind.is_create() {
+            message.depth > 0
+        } else {
+            !db.is_persistent(&message.code_address)
+        };
+        match db.active_fork_url().and_then(|rpc| self.core.config.chain_builds.get(&rpc)) {
+            Some(build) if profiled => {
+                let mut env = *running;
+                resolve_execution_spec::<EvmFactoryFor<FEN>>(
+                    build.evm_version,
+                    build.hardfork,
+                    &mut env,
+                    ExecutionSpecContext::fork(chain_id, None),
+                    None,
+                );
+                env.spec
+            }
+            _ => run_spec,
         }
     }
 
@@ -1872,6 +1928,72 @@ impl<FEN: FoundryEvmNetwork> Cheatcodes<FEN> {
     #[inline(always)]
     const fn has_active_env_overrides(&self) -> bool {
         self.env_overrides.is_any_set()
+    }
+
+    /// Returns the broadcaster, salt and CREATE2 libraries to deploy before the first broadcast
+    /// to `rpc`: those of the endpoint's profile build, or the run's libraries, which the runner
+    /// already deploys on the `--rpc-url` endpoint.
+    pub fn take_chain_libraries(
+        &mut self,
+        rpc: &str,
+        depth: usize,
+        caller: Address,
+    ) -> Option<ChainLibraries> {
+        let config = &self.core.config;
+        let broadcast = self.broadcast.as_ref()?;
+        let depth = self.deploy_code_caller_depth(depth);
+        if depth < broadcast.depth
+            || caller != broadcast.original_caller
+            || (depth != broadcast.depth && !broadcast.deploy_from_code)
+            || self.chain_libraries_deployed.contains(rpc)
+        {
+            return None;
+        }
+        let (salt, libraries) = match config.chain_builds.get(rpc) {
+            Some(build) => (build.create2_library_salt, &build.create2_libraries),
+            None if config.evm_opts.fork_url.as_deref() != Some(rpc) => {
+                (config.create2_library_salt, &config.create2_libraries)
+            }
+            None => return None,
+        };
+        if libraries.is_empty() {
+            return None;
+        }
+        self.chain_libraries_deployed.insert(rpc.to_string());
+        Some((broadcast.new_origin, salt, libraries.clone()))
+    }
+
+    /// Records a CREATE2 library deployment by `from` at `nonce` as a broadcastable transaction.
+    pub fn record_library_deployment(
+        &mut self,
+        evm: &FoundryEvmFor<'_, FEN>,
+        backend: &dyn CheatcodesBackend<FEN>,
+        from: Address,
+        nonce: u64,
+        create2_deployer: Address,
+        input: Bytes,
+    ) {
+        let db = backend.backend();
+        let chain_id = self
+            .env_overrides
+            .get(db.active_fork_id())
+            .and_then(|overrides| overrides.chain_id)
+            .unwrap_or(evm.version().chain_id);
+        let mut tx_req = TransactionRequestFor::<FEN>::default()
+            .with_from(from)
+            .with_to(create2_deployer)
+            .with_input(input)
+            .with_nonce(nonce)
+            .with_chain_id(chain_id);
+        if let Some(fee_token) = self.fee_token {
+            tx_req.set_fee_token(fee_token);
+        }
+        self.broadcastable_transactions.push_back(BroadcastableTransaction {
+            rpc: db.active_fork_url(),
+            transaction: TransactionMaybeSigned::new(tx_req),
+            contract_address: None,
+        });
+        debug!(target: "cheatcodes", tx=?self.broadcastable_transactions.back().unwrap(), "broadcastable library deployment");
     }
 
     /// Called after a frame interpreter has been initialized.
