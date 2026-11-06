@@ -9088,6 +9088,7 @@ mod tests {
                 sepolia = { url = "https://sepolia.example", retries = 2, auth = "token" }
                 optimism = { endpoints = ["https://op.example"], compute_units_per_second = 10 }
                 base = { endpoint = "https://base.example", timeout = 5 }
+                arbitrum = { endpoint = "https://arb.example", profile = "default" }
 
                 [etherscan]
                 mainnet = { key = "KEY", chainId = 1 }
