@@ -2,6 +2,7 @@
 
 use chrono::DateTime;
 use std::{error::Error, path::PathBuf};
+use syn as _;
 
 fn main() -> Result<(), Box<dyn Error>> {
     println!("cargo:rerun-if-changed=build.rs");

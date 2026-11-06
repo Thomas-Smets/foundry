@@ -40,10 +40,12 @@ use evm2::{
     },
     interpreter::InstrStop,
 };
-use foundry_evm_hardforks::FoundryHardfork;
 use foundry_primitives::{FoundryReceiptEnvelope, FoundryTxEnvelope, FoundryTxType};
 use std::{fmt, sync::Arc};
 use tempo_precompiles::{NONCE_PRECOMPILE_ADDRESS, nonce::NonceManager};
+
+#[cfg(any(feature = "base", feature = "optimism"))]
+use foundry_evm_hardforks::FoundryHardfork;
 
 #[cfg(any(feature = "base", feature = "optimism"))]
 pub(crate) mod optimism;
@@ -271,6 +273,7 @@ impl<'a, N: AnvilEvmNetwork> AnvilBlockExecutor<'a, N> {
 
     /// Configures OP-specific block accounting.
     #[cfg(any(feature = "base", feature = "optimism"))]
+    #[cfg_attr(not(feature = "optimism"), allow(clippy::missing_const_for_fn))]
     pub(crate) fn with_deposit_hardfork(mut self, hardfork: FoundryHardfork) -> Self {
         #[cfg(feature = "optimism")]
         {
