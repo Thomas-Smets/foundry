@@ -1031,6 +1031,7 @@ mod tests {
                 project_root: dir.path().into(),
                 output: config.project().unwrap().compile().unwrap(),
                 target,
+                profile_builds: Vec::new(),
             },
         )
         .unwrap();
